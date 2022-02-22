@@ -1,0 +1,612 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "adminUsername": {
+      "type": "string",
+      "metadata": {
+        "description": "Username for the virtual Machines"
+      }
+    },
+    "adminPassword": {
+      "type": "securestring",
+      "minLength": 12,
+      "metadata": {
+        "description": "Password for Barracuda WAF Admin Interface and Backend Web Servers(Min Length: 12)"
+      }
+    },
+    "webVmCount": {
+      "type": "int",
+      "defaultValue": 2,
+      "metadata": {
+        "description": "Number of backend Web servers to be deployed"
+      }
+    },
+    "remoteAllowedCIDR": {
+      "type": "string",
+      "minLength": 7,
+      "defaultValue": "0.0.0.0/0",
+      "metadata": {
+        "description": "Enter Public IP CIDR to allow for accessing the deployment.Enter in 0.0.0.0/0 format. You can always modify these later in NSG Settings"
+      }
+    },
+    "_artifactsLocation": {
+      "type": "string",
+      "defaultValue": "https://raw.githubusercontent.com/SpektraSystems/spektra-azure-quickstart-templates/master/barracuda-waf-iis/",
+      "metadata": {
+        "description": "The base URI where artifacts required by this template are located. When the template is deployed using the accompanying scripts, a private location in the subscription will be used and this value will be automatically generated."
+      }
+    },
+    "_artifactsLocationSasToken": {
+      "type": "securestring",
+      "metadata": {
+        "description": "The sasToken required to access _artifactsLocation.  When the template is deployed using the accompanying scripts, a sasToken will be automatically generated.Leave blank if unsure"
+      },
+      "defaultValue": ""
+    }
+  },
+  "variables": {
+    "fortinetVmSize": "Standard_D2_v2",
+    "webVmSize": "Standard_D2_v2",
+    "storageAccountType": "Premium_LRS",
+    "diagStorageAccountName": "[concat('diagstorage',uniqueString(resourceGroup().id))]",
+    "virtualNetworkName": "fortinet-vnet",
+    "webNSGName": "web-NSG",
+    "fortinetNSGName": "fortinet-NSG",
+    "fortinetSubnetName": "fortinet-subnet",
+    "webSubnetName": "web-subnet",
+    "lbIPAddressName": "lb-pip",
+    "lbDnsLabel": "[concat('lbpip',uniqueString(resourceGroup().id))]",
+    "loadBalancerName": "web-rdp-lb",
+    "loadBalancerID": "[resourceId('Microsoft.Network/loadBalancers',variables('loadBalancerName'))]",
+    "loadBalancerIPID": "[resourceId('Microsoft.Network/publicIPAddresses',variables('lbIPAddressName'))]",
+    "frontEndIPConfigID": "[concat(resourceId('Microsoft.Network/loadBalancers',variables('loadBalancerName')),'/frontendIPConfigurations/loadBalancerFrontEnd')]",
+    "fortinetAvailSetName": "fortinet-as",
+    "fortinetVmName": "fortinet-vm",
+    "fortinetVmIPAddressName": "fortinet-pip",
+    "fortinetVmDnsLabel": "[concat('fortinetpip',uniqueString(resourceGroup().id))]",
+    "fortinetVmNicName": "[concat(variables('fortinetVmName'), '-nic')]",
+    "webAvailSetName": "web-as",
+    "webVmName": "web-vm",
+    "webVmNicName": "[concat(variables('webVmName'), '-nic')]",
+    "webVmSku": "2012-R2-Datacenter",
+    "webVmPublisher": "MicrosoftWindowsServer",
+    "webVmOffer": "WindowsServer",
+    "osDiskDeleteOption": "Delete",
+    "dscfilename": "webserverconfig.zip",
+    "webVmExtensionFunction": "webServerConfig.ps1\\WebServerConfig",
+    "OSDiskName": "OSDisk",
+    "barracudaNetworksTags": {
+      "type": "object",
+      "provider": "3285C15D-A16F-479C-8886-67042BCB03A9"
+    },
+    "quickstartTags": {
+      "type": "object",
+      "name": "barracuda-waf-iis"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "name": "[variables('diagStorageAccountName')]",
+      "apiVersion": "2016-01-01",
+      "location": "[resourceGroup().location]",
+      "comments": "Storage account used to store VM diagnostics data",
+      "tags": {
+        "displayName": "Diagnostics Storage Account",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "Storage",
+      "properties": {
+
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "name": "[variables('fortinetNSGName')]",
+      "apiVersion": "2016-03-30",
+      "location": "[resourceGroup().location]",
+      "comments": " NSG for fortinet subnet",
+      "tags": {
+        "displayName": "fortinet NSG",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "properties": {
+        "securityRules": [
+          {
+            "name": "HTTP-allow",
+            "properties": {
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "80",
+              "sourceAddressPrefix": "[parameters('remoteAllowedCIDR')]",
+              "destinationAddressPrefix": "10.0.0.0/24",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "HTTPS-allow",
+            "properties": {
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "443",
+              "sourceAddressPrefix": "[parameters('remoteAllowedCIDR')]",
+              "destinationAddressPrefix": "10.0.0.0/24",
+              "access": "Allow",
+              "priority": 120,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "AdminPortal-allow",
+            "properties": {
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "8000",
+              "sourceAddressPrefix": "[parameters('remoteAllowedCIDR')]",
+              "destinationAddressPrefix": "10.0.0.0/24",
+              "access": "Allow",
+              "priority": 130,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "name": "[variables('webNSGName')]",
+      "apiVersion": "2016-03-30",
+      "location": "[resourceGroup().location]",
+      "comments": " NSG for Web subnet",
+      "tags": {
+        "displayName": "Web NSG",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "properties": {
+        "securityRules": [
+          {
+            "name": "RDP-allow",
+            "properties": {
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "3389",
+              "sourceAddressPrefix": "[parameters('remoteAllowedCIDR')]",
+              "destinationAddressPrefix": "10.0.1.0/24",
+              "access": "Allow",
+              "priority": 110,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "name": "[variables('fortinetVmIPAddressName')]",
+      "apiVersion": "2016-03-30",
+      "location": "[resourceGroup().location]",
+      "comments": " Public IP used by the fortinet VM",
+      "tags": {
+        "displayName": "fortinet Public IP",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "idleTimeoutInMinutes": 4,
+        "dnsSettings": {
+          "domainNameLabel": "[variables('fortinetVmDnsLabel')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "name": "[variables('lbIPAddressName')]",
+      "apiVersion": "2016-03-30",
+      "location": "[resourceGroup().location]",
+      "comments": "Public IP used by the Load Balancer for RDP into Web Servers",
+      "tags": {
+        "displayName": "LB Public IP",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "properties": {
+        "publicIPAllocationMethod": "Static",
+        "idleTimeoutInMinutes": 4,
+        "dnsSettings": {
+          "domainNameLabel": "[variables('lbDnsLabel')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "name": "[variables('virtualNetworkName')]",
+      "apiVersion": "2016-03-30",
+      "location": "[resourceGroup().location]",
+      "comments": "Virtual network for overall solution",
+      "tags": {
+        "displayName": "fortinet Virtual Network",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "dependsOn": [
+        "[concat('Microsoft.Network/networkSecurityGroups/', variables('webNSGName'))]",
+        "[concat('Microsoft.Network/networkSecurityGroups/', variables('fortinetNSGName'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.0.0.0/16"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('fortinetSubnetName')]",
+            "properties": {
+              "addressPrefix": "10.0.0.0/24",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('fortinetNSGName'))]"
+              }
+            }
+          },
+          {
+            "name": "[variables('webSubnetName')]",
+            "properties": {
+              "addressPrefix": "10.0.1.0/24",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('webNSGName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/availabilitySets",
+      "name": "[variables('webAvailSetName')]",
+      "apiVersion": "2017-12-01",
+      "location": "[resourceGroup().location]",
+      "comments": "This is the Availability Set for all Web VMs",
+      "tags": {
+        "displayName": "Web Avail Set",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "properties": {
+        "PlatformUpdateDomainCount": 1,
+        "PlatformFaultDomainCount": 2
+      },
+      "sku": {
+        "name": "Aligned"
+      }
+    },
+    {
+      "type": "Microsoft.Compute/availabilitySets",
+      "name": "[variables('fortinetAvailSetName')]",
+      "apiVersion": "2017-12-01",
+      "location": "[resourceGroup().location]",
+      "comments": "This is the Availability Set for fortinet VM",
+      "tags": {
+        "displayName": "fortinet Avail Set",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "properties": {
+        "PlatformUpdateDomainCount": 1,
+        "PlatformFaultDomainCount": 2
+      },
+      "sku": {
+        "name": "Aligned"
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers",
+      "name": "[variables('loadBalancerName')]",
+      "apiVersion": "2015-06-15",
+      "location": "[resourceGroup().location]",
+      "comments": "This Load Balancer is used to allow RDP access to Web VMs",
+      "tags": {
+        "displayName": "Web RDP Load Balancer",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "dependsOn": [
+        "[concat('Microsoft.Network/publicIPAddresses/', variables('lbIPAddressName'))]"
+      ],
+      "properties": {
+        "frontendIPConfigurations": [
+          {
+            "name": "loadBalancerFrontEnd",
+            "properties": {
+              "publicIPAddress": {
+                "id": "[variables('loadBalancerIPID')]"
+              }
+            }
+          }
+        ],
+        "backendAddressPools": [
+          {
+            "name": "loadBalancerBackEnd"
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/loadBalancers/inboundNatRules",
+      "name": "[concat(variables('loadBalancerName'), '/', 'RDPVM', copyIndex(1))]",
+      "apiVersion": "2016-03-30",
+      "location": "[resourceGroup().location]",
+      "comments": "This resource adds all the NAT rules needed to allow RDP access to Web Servers VMs",
+      "tags": {
+        "displayName": "LB RDP NAT rules",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "dependsOn": [
+        "[concat('Microsoft.Network/loadBalancers/', variables('loadBalancerName'))]"
+      ],
+      "copy": {
+        "name": "lbNatLoop",
+        "count": "[parameters('webvmCount')]"
+      },
+      "properties": {
+        "frontendIPConfiguration": {
+          "id": "[variables('frontEndIPConfigID')]"
+        },
+        "protocol": "Tcp",
+        "frontendPort": "[copyIndex(5001)]",
+        "backendPort": 3389,
+        "enableFloatingIP": false
+      }
+    },
+    {
+      "name": "[concat(variables('webVmNicName'), copyindex(1))]",
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2016-03-30",
+      "location": "[resourceGroup().location]",
+      "comments": "NICs for Web Servers",
+      "tags": {
+        "displayName": "Web VM NICs",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "dependsOn": [
+        "[concat('Microsoft.Network/virtualNetworks/', variables('virtualNetworkName'))]",
+        "[concat('Microsoft.Network/loadBalancers/',variables('loadBalancerName'),'/inboundNatRules/', 'RDPVM', copyIndex(1))]"
+      ],
+      "copy": {
+        "name": "WebnicLoop",
+        "count": "[parameters('webVmCount')]"
+      },
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[concat(resourceId('Microsoft.Network/virtualNetworks', variables('virtualNetworkName')), '/subnets/', variables('webSubnetName'))]"
+              },
+              "loadBalancerBackendAddressPools": [
+                {
+                  "id": "[concat(variables('loadBalancerID'), '/backendAddressPools/LoadBalancerBackend')]"
+                }
+              ],
+              "loadBalancerInboundNatRules": [
+                {
+                  "id": "[concat(variables('loadBalancerID'),'/inboundNatRules/RDPVM',copyIndex(1))]"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "name": "[variables('fortinetVmNicName')]",
+      "apiVersion": "2016-03-30",
+      "location": "[resourceGroup().location]",
+      "comments": "NIC for fortinet VM",
+      "tags": {
+        "displayName": "fortinet VM NIC",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "dependsOn": [
+        "[concat('Microsoft.Network/virtualNetworks/', variables('virtualNetworkName'))]",
+        "[concat(resourceId('Microsoft.Network/publicIPAddresses', variables('fortinetVmIPAddressName')))]"
+      ],
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "publicIPAddress": {
+                "id": "[concat(resourceId('Microsoft.Network/publicIPAddresses', variables('fortinetVmIPAddressName')))]"
+              },
+              "subnet": {
+                "id": "[concat(resourceId('Microsoft.Network/virtualNetworks', variables('virtualNetworkName')), '/subnets/', variables('fortinetSubnetName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "name": "[concat(variables('webVmName'), copyindex(1))]",
+      "apiVersion": "2017-12-01",
+      "location": "[resourceGroup().location]",
+      "comments": " Web Server VMs",
+      "tags": {
+        "displayName": "Web VMs",
+        "quickstartName": "[variables('quickstartTags').name]",
+        "provider": "[variables('barracudaNetworksTags').provider]"
+      },
+      "dependsOn": [
+        "[concat('Microsoft.Network/networkInterfaces/', variables('webVmNicName'), copyindex(1))]",
+        "[concat('Microsoft.Compute/availabilitySets/', variables('webAvailSetName'))]"
+      ],
+      "copy": {
+        "name": "webSrvMachineLoop",
+        "count": "[parameters('webVmCount')]"
+      },
+      "properties": {
+        "availabilitySet": {
+          "id": "[resourceId('Microsoft.Compute/availabilitySets',variables('webAvailSetName'))]"
+        },
+        "hardwareProfile": {
+          "vmSize": "[variables('webVmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[concat('webserver',copyindex(1))]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "[variables('webVmPublisher')]",
+            "offer": "[variables('webVmOffer')]",
+            "sku": "[variables('webVmSku')]",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "caching": "ReadWrite"
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('webVmNicName'), copyindex(1)))]"
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": "true",
+            "storageUri": "[reference(resourceId('Microsoft.Storage/storageAccounts/', variables('diagStorageAccountName'))).primaryEndpoints.blob]"
+          }
+        }
+      },
+      "resources": [
+        {
+          "type": "Microsoft.Compute/virtualMachines/extensions",
+          "name": "[concat(variables('webVmName'), copyindex(1),'/',concat(variables('webVmName'), copyindex(1),'-web-dsc'))]",
+          "apiVersion": "2015-06-15",
+          "location": "[resourceGroup().location]",
+          "comments": "This VM Extension loops to setup IIS in each Web VMs using DSC",
+          "tags": {
+            "displayName": "Web VM Extensions",
+            "quickstartName": "[variables('quickstartTags').name]",
+            "provider": "[variables('barracudaNetworksTags').provider]"
+          },
+          "dependsOn": [
+            "[concat('Microsoft.Compute/virtualMachines/', variables('webVmName'), copyindex(1))]"
+          ],
+          "properties": {
+            "publisher": "Microsoft.Powershell",
+            "type": "DSC",
+            "typeHandlerVersion": "2.19",
+            "autoUpgradeMinorVersion": true,
+            "settings": {
+              "modulesUrl": "[concat(parameters('_artifactsLocation'),'scripts/',variables('dscfilename'),parameters('_artifactsLocationSasToken'))]",
+              "configurationFunction": "[variables('webVmExtensionFunction')]",
+              "wmfVersion": "4.0",
+              "Properties": {
+
+              }
+            },
+            "protectedSettings": {
+
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "name": "[variables('fortinetVmName')]",
+      "apiVersion": "2021-07-01",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "location": "[resourceGroup().location]",
+      "plan": {
+        "name": "fortinet_fw-vm",
+        "publisher": "fortinet",
+        "product": "fortinet_fortiweb-vm_v5"
+      },
+      "dependsOn": [
+        "[variables('fortinetVmNicName')]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[variables('fortinetVmSize')]"
+        },
+        "osProfile": {
+          "computerName": "fortinetserver",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "fortinet",
+            "offer": "fortinet_fortiweb-vm_v5",
+            "sku": "fortinet_fw-vm",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage"
+          },
+          "dataDisks": [
+            {
+              "diskSizeGB": 30,
+              "lun": 0,
+              "createOption": "Empty"
+            }
+          ]
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('fortinetVmNicName')))]"
+            }
+          ]
+        },
+        "availabilitySet": {
+          "id": "[resourceId('Microsoft.Compute/availabilitySets',variables('fortinetAvailSetName'))]"
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "loadBalancerIP": {
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses',variables('lbIPAddressName'))).ipAddress]",
+      "type": "string"
+    },
+    "fortinetIP": {
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses',variables('fortinetVmIPAddressName'))).ipAddress]",
+      "type": "string"
+    },
+    "loadBalancerFqdn": {
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses',variables('lbIPAddressName'))).dnsSettings.fqdn]",
+      "type": "string"
+    },
+    "fortinetFqdn": {
+      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses',variables('fortinetVmIPAddressName'))).dnsSettings.fqdn]",
+      "type": "string"
+    }
+  }
+}
